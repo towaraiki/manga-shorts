@@ -4,13 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       title:
-        description: 'メインタイトル（例: 間違いには注意w）'
+        description: 'メインタイトル（例: このあと、分からせるw）'
         required: true
-        default: '間違いには注意w'
+        default: 'このあと、分からせるw'
       quote:
-        description: '引用クレジット（例: 引用:MTcomic.jpg）'
+        description: '引用クレジット（例: 引用:かまあげ館）'
         required: true
-        default: '引用:MTcomic.jpg'
+        default: '引用:かまあげ館'
       image_url:
         description: '漫画コマ画像のURL（省略時はデフォルト画像）'
         required: false
@@ -19,6 +19,11 @@ on:
         description: '最下部案内文'
         required: false
         default: '続きは右上の・・・から説明へ'
+
+  # GitHubのIssuesに投稿された時も自動起動！
+  issues:
+    types: [opened]
+
   repository_dispatch:
     types: [render_short]
 
@@ -44,25 +49,58 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y google-chrome-stable ffmpeg fonts-noto-cjk
 
-      - name: Prepare comic image
-        id: prepare_img
+      - name: Parse Inputs and Prepare Comic Image
+        id: prepare_data
         run: |
-          IMAGE_URL="${{ github.event.inputs.image_url || github.event.client_payload.image_url }}"
+          # 1. タイトル・引用・画像URLの抽出
+          if [ "${{ github.event_name }}" = "issues" ]; then
+            ISSUE_TITLE="${{ github.event.issue.title }}"
+            ISSUE_BODY="${{ github.event.issue.body }}"
+
+            echo "Parsing Issue Title: $ISSUE_TITLE"
+            
+            # Issue本文から画像URLを抽出 (![...](URL) または <img src="URL"> または https://...jpg/png)
+            IMG_URL=$(echo "$ISSUE_BODY" | grep -o -E 'https://github\.com/user-attachments/assets/[a-zA-Z0-9_-]+|https?://[^\s)]+\.(jpg|jpeg|png|webp)' | head -n 1 || true)
+            
+            # タイトルと引用のパース（「タイトル: ○○ 引用: △△」形式にも対応）
+            PARSED_TITLE=$(node -e '
+              const raw = process.argv[1];
+              const tMatch = raw.match(/(?:タイトル|題名|title)[:：]\s*([^\r\n]+?)(?=\s+(?:引用|クレジット|quote)[:：]|$)/i);
+              console.log(tMatch ? tMatch[1].trim() : raw);
+            ' "$ISSUE_TITLE")
+
+            PARSED_QUOTE=$(node -e '
+              const raw = process.argv[1];
+              const qMatch = raw.match(/(?:引用|クレジット|quote)[:：]\s*([^\r\n]+?)(?=\s+(?:タイトル|題名|title)[:：]|$)/i);
+              console.log(qMatch ? qMatch[1].trim() : "引用:公式");
+            ' "$ISSUE_TITLE")
+
+            echo "title=$PARSED_TITLE" >> $GITHUB_OUTPUT
+            echo "quote=$PARSED_QUOTE" >> $GITHUB_OUTPUT
+            IMAGE_URL="$IMG_URL"
+          else
+            # workflow_dispatch または repository_dispatch
+            echo "title=${{ github.event.inputs.title || github.event.client_payload.title || 'このあと、分からせるw' }}" >> $GITHUB_OUTPUT
+            echo "quote=${{ github.event.inputs.quote || github.event.client_payload.quote || '引用:かまあげ館' }}" >> $GITHUB_OUTPUT
+            IMAGE_URL="${{ github.event.inputs.image_url || github.event.client_payload.image_url }}"
+          fi
+
+          # 2. 画像のダウンロード
           if [ -n "$IMAGE_URL" ]; then
             echo "Downloading image from: $IMAGE_URL"
             curl -L -o public/custom_comic.jpg "$IMAGE_URL"
             echo "comic_file=custom_comic.jpg" >> $GITHUB_OUTPUT
           else
-            echo "Using default sample comic"
+            echo "Using default comic"
             echo "comic_file=sample_comic.jpg" >> $GITHUB_OUTPUT
           fi
 
       - name: Render Remotion Video
         run: |
-          TITLE="${{ github.event.inputs.title || github.event.client_payload.title || '間違いには注意w' }}"
-          QUOTE="${{ github.event.inputs.quote || github.event.client_payload.quote || '引用:MTcomic.jpg' }}"
-          COMIC_FILE="${{ steps.prepare_img.outputs.comic_file }}"
-          GUIDE_TEXT="${{ github.event.inputs.guide_text || github.event.client_payload.guide_text || '続きは右上の・・・から説明へ' }}"
+          TITLE="${{ steps.prepare_data.outputs.title }}"
+          QUOTE="${{ steps.prepare_data.outputs.quote }}"
+          COMIC_FILE="${{ steps.prepare_data.outputs.comic_file }}"
+          GUIDE_TEXT="${{ github.event.inputs.guide_text || '続きは右上の・・・から説明へ' }}"
 
           PROPS_JSON=$(node -e "console.log(JSON.stringify({
             title: process.argv[1],
@@ -90,8 +128,8 @@ jobs:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
           if [ -n "$DISCORD_WEBHOOK" ]; then
-            TITLE="${{ github.event.inputs.title || github.event.client_payload.title || '間違いには注意w' }}"
-            QUOTE="${{ github.event.inputs.quote || github.event.client_payload.quote || '引用:MTcomic.jpg' }}"
+            TITLE="${{ steps.prepare_data.outputs.title }}"
+            QUOTE="${{ steps.prepare_data.outputs.quote }}"
             
             echo "Sending completed video to Discord Webhook..."
             curl -H "Content-Type: multipart/form-data" \
@@ -102,3 +140,15 @@ jobs:
           else
             echo "No DISCORD_WEBHOOK_URL secret found. Skipping Discord notification."
           fi
+
+      - name: Comment on Issue if triggered by Issue
+        if: github.event_name == 'issues'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '✅ **動画の生成が完了しました！**\nDiscordに動画を送信しました（Artifactからもダウンロード可能です）。'
+            })
