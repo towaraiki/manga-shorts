@@ -1,0 +1,9 @@
+node_modules/
+out/
+drive_assets/
+drive_html.txt
+inspect_drive.py
+parse_items.py
+*.log
+.env
+bot_config.json

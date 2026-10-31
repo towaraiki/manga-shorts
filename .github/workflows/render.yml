@@ -1,0 +1,104 @@
+name: Render Manga Short Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      title:
+        description: 'メインタイトル（例: 間違いには注意w）'
+        required: true
+        default: '間違いには注意w'
+      quote:
+        description: '引用クレジット（例: 引用:MTcomic.jpg）'
+        required: true
+        default: '引用:MTcomic.jpg'
+      image_url:
+        description: '漫画コマ画像のURL（省略時はデフォルト画像）'
+        required: false
+        default: ''
+      guide_text:
+        description: '最下部案内文'
+        required: false
+        default: '続きは右上の・・・から説明へ'
+  repository_dispatch:
+    types: [render_short]
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Chrome and dependencies for Remotion
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable ffmpeg fonts-noto-cjk
+
+      - name: Prepare comic image
+        id: prepare_img
+        run: |
+          IMAGE_URL="${{ github.event.inputs.image_url || github.event.client_payload.image_url }}"
+          if [ -n "$IMAGE_URL" ]; then
+            echo "Downloading image from: $IMAGE_URL"
+            curl -L -o public/custom_comic.jpg "$IMAGE_URL"
+            echo "comic_file=custom_comic.jpg" >> $GITHUB_OUTPUT
+          else
+            echo "Using default sample comic"
+            echo "comic_file=sample_comic.jpg" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Render Remotion Video
+        run: |
+          TITLE="${{ github.event.inputs.title || github.event.client_payload.title || '間違いには注意w' }}"
+          QUOTE="${{ github.event.inputs.quote || github.event.client_payload.quote || '引用:MTcomic.jpg' }}"
+          COMIC_FILE="${{ steps.prepare_img.outputs.comic_file }}"
+          GUIDE_TEXT="${{ github.event.inputs.guide_text || github.event.client_payload.guide_text || '続きは右上の・・・から説明へ' }}"
+
+          PROPS_JSON=$(node -e "console.log(JSON.stringify({
+            title: process.argv[1],
+            quote: process.argv[2],
+            comicSrc: process.argv[3],
+            waveBgSrc: 'wave_bg.mp4',
+            bgmSrc: 'bgm.mp3',
+            guideText: process.argv[4],
+            fadeOutStartFrame: 225,
+            fadeOutEndFrame: 255
+          }))" "$TITLE" "$QUOTE" "$COMIC_FILE" "$GUIDE_TEXT")
+
+          mkdir -p out
+          npx remotion render MangaShort out/manga_short.mp4 --props="$PROPS_JSON"
+
+      - name: Upload video as GitHub Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: manga-short-video
+          path: out/manga_short.mp4
+          retention-days: 7
+
+      - name: Send video to Discord Webhook
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -n "$DISCORD_WEBHOOK" ]; then
+            TITLE="${{ github.event.inputs.title || github.event.client_payload.title || '間違いには注意w' }}"
+            QUOTE="${{ github.event.inputs.quote || github.event.client_payload.quote || '引用:MTcomic.jpg' }}"
+            
+            echo "Sending completed video to Discord Webhook..."
+            curl -H "Content-Type: multipart/form-data" \
+                 -X POST \
+                 -F "file=@out/manga_short.mp4;filename=${TITLE}.mp4" \
+                 -F "content=✅ **GitHub Actionsでショート動画が完成しました！**\n• **タイトル**: ${TITLE}\n• **引用**: ${QUOTE}" \
+                 "$DISCORD_WEBHOOK"
+          else
+            echo "No DISCORD_WEBHOOK_URL secret found. Skipping Discord notification."
+          fi
